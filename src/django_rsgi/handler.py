@@ -1,7 +1,6 @@
-import asyncio
+import io
 import logging
 import sys
-import tempfile
 import traceback
 from contextlib import aclosing, closing
 
@@ -24,13 +23,51 @@ from django.utils.functional import cached_property
 
 logger = logging.getLogger("django.request")
 
+# Pre-populated cache for common header names to avoid redundant string manipulation
+_HEADER_NAME_CACHE = {
+    "accept": "HTTP_ACCEPT",
+    "accept-encoding": "HTTP_ACCEPT_ENCODING",
+    "accept-language": "HTTP_ACCEPT_LANGUAGE",
+    "authorization": "HTTP_AUTHORIZATION",
+    "connection": "HTTP_CONNECTION",
+    "content-length": "CONTENT_LENGTH",
+    "content-type": "CONTENT_TYPE",
+    "cookie": "HTTP_COOKIE",
+    "host": "HTTP_HOST",
+    "referer": "HTTP_REFERER",
+    "user-agent": "HTTP_USER_AGENT",
+    "x-real-ip": "HTTP_X_REAL_IP",
+    "x-forwarded-for": "HTTP_X_FORWARDED_FOR",
+    "x-forwarded-proto": "HTTP_X_FORWARDED_PROTO",
+    "x-forwarded-host": "HTTP_X_FORWARDED_HOST",
+    "x-forwarded-port": "HTTP_X_FORWARDED_PORT",
+    "x-requested-with": "HTTP_X_REQUESTED_WITH",
+}
+
+
+def get_normalized_header_name(name):
+    """
+    Map an RSGI header name to a WSGI-style META key.
+    """
+    try:
+        return _HEADER_NAME_CACHE[name]
+    except KeyError:
+        if name == "content-length":
+            res = "CONTENT_LENGTH"
+        elif name == "content-type":
+            res = "CONTENT_TYPE"
+        else:
+            res = f"HTTP_{name.upper().replace('-', '_')}"
+        _HEADER_NAME_CACHE[name] = res
+        return res
+
 
 def get_script_prefix(scope):
     """
     Return the script prefix to use from either the scope or a setting.
     """
-    if settings.FORCE_SCRIPT_NAME:
-        return settings.FORCE_SCRIPT_NAME
+    if force_script_name := settings.FORCE_SCRIPT_NAME:
+        return force_script_name
     return getattr(scope, "root_path", "")
 
 
@@ -45,69 +82,79 @@ class RSGIRequest(HttpRequest):
         self._post_parse_error = False
         self._read_started = False
         self.resolver_match = None
-        self.path = scope.path
-        self.script_name = get_script_prefix(scope)
-        if self.script_name:
-            self.path_info = scope.path.removeprefix(self.script_name)
+
+        path = scope.path
+        self.path = path
+
+        script_name = get_script_prefix(scope)
+        self.script_name = script_name
+
+        # Optimization: Only perform removeprefix if script_name is not empty
+        if script_name:
+            self.path_info = path.removeprefix(script_name)
         else:
-            self.path_info = scope.path
-        # HTTP basics.
-        self.method = scope.method.upper()
-        # Ensure query string is handled.
-        query_string = scope.query_string or ""
+            self.path_info = path
+
+        # Optimization: RSGI spec guarantees method is already uppercased
+        method = scope.method
+        self.method = method
+
+        # Initialize META with basic info
         self.META = {
-            "REQUEST_METHOD": self.method,
-            "QUERY_STRING": query_string,
-            "SCRIPT_NAME": self.script_name,
+            "REQUEST_METHOD": method,
+            "QUERY_STRING": scope.query_string or "",
+            "SCRIPT_NAME": script_name,
             "PATH_INFO": self.path_info,
             "wsgi.multithread": True,
             "wsgi.multiprocess": True,
         }
-        if scope.client:
+
+        # Client/Server parsing
+        client = scope.client
+        if client:
             try:
-                host, port = scope.client.rsplit(":", 1)
+                host, port = client.rsplit(":", 1)
                 self.META["REMOTE_ADDR"] = host
                 self.META["REMOTE_HOST"] = host
                 self.META["REMOTE_PORT"] = int(port)
             except ValueError:
-                self.META["REMOTE_ADDR"] = scope.client
-        if scope.server:
+                self.META["REMOTE_ADDR"] = client
+
+        server = scope.server
+        if server:
             try:
-                host, port = scope.server.rsplit(":", 1)
+                host, port = server.rsplit(":", 1)
                 self.META["SERVER_NAME"] = host
                 self.META["SERVER_PORT"] = str(port)
             except ValueError:
-                self.META["SERVER_NAME"] = scope.server
+                self.META["SERVER_NAME"] = server
         else:
             self.META["SERVER_NAME"] = "unknown"
             self.META["SERVER_PORT"] = "0"
 
-        # Headers go into META.
-        for name in scope.headers:
-            if name == "content-length":
-                corrected_name = "CONTENT_LENGTH"
-            elif name == "content-type":
-                corrected_name = "CONTENT_TYPE"
-            else:
-                corrected_name = "HTTP_%s" % name.upper().replace("-", "_")
+        # Headers normalization loop
+        meta = self.META
+        headers = scope.headers
+        for name in headers:
+            corrected_name = get_normalized_header_name(name)
 
-            values = scope.headers.get_all(name)
+            # Using get_all to join multiple header values as per Django standards
+            values = headers.get_all(name)
             value = ",".join(values)
 
             if corrected_name == "HTTP_COOKIE":
                 value = value.rstrip("; ")
-                if "HTTP_COOKIE" in self.META:
-                    value = self.META[corrected_name] + "; " + value
-            elif corrected_name in self.META:
-                value = self.META[corrected_name] + "," + value
-            self.META[corrected_name] = value
+                if "HTTP_COOKIE" in meta:
+                    value = meta["HTTP_COOKIE"] + "; " + value
+            elif corrected_name in meta:
+                value = meta[corrected_name] + "," + value
+
+            meta[corrected_name] = value
 
         # Pull out request encoding, if provided.
-        self._set_content_type_params(self.META)
+        self._set_content_type_params(meta)
         # Directly assign the body file to be our stream.
         self._stream = body_file
-        # Other bits.
-        self.resolver_match = None
 
     @cached_property
     def GET(self):
@@ -170,15 +217,14 @@ class RSGIHandler(base.BaseHandler):
         except Exception:
             return
 
-        body_file = tempfile.SpooledTemporaryFile(
-            max_size=settings.FILE_UPLOAD_MAX_MEMORY_SIZE, mode="w+b"
-        )
-        body_file.write(body)
-        body_file.seek(0)
+        with closing(io.BytesIO(body)) as body_file:
+            script_prefix = get_script_prefix(scope)
+            set_script_prefix(script_prefix)
 
-        with closing(body_file):
-            set_script_prefix(get_script_prefix(scope))
-            await signals.request_started.asend(sender=self.__class__, scope=scope)
+            # Optimization: Skip signal emission if no receivers connected
+            if signals.request_started.receivers:
+                await signals.request_started.asend(sender=self.__class__, scope=scope)
+
             # Get the request and check for basic issues.
             request, error_response = self.create_request(scope, body_file)
             if request is None:
@@ -186,33 +232,19 @@ class RSGIHandler(base.BaseHandler):
                 await sync_to_async(error_response.close)()
                 return
 
-            class RequestProcessed(Exception):
-                pass
-
             response = None
             try:
-                try:
-                    async with asyncio.TaskGroup() as tg:
-
-                        async def watch_disconnect():
-                            await protocol.client_disconnect()
-                            raise RequestAborted()
-
-                        tg.create_task(watch_disconnect())
-                        response = await self.run_get_response(request)
-                        await self.send_response(response, protocol)
-                        raise RequestProcessed
-                except* (RequestProcessed, RequestAborted):
-                    pass
-            except BaseExceptionGroup as exception_group:
-                if len(exception_group.exceptions) == 1:
-                    raise exception_group.exceptions[0]
-                raise
+                response = await self.run_get_response(request)
+                await self.send_response(response, protocol)
+            except RequestAborted:
+                pass
+            finally:
+                if response is not None:
+                    await sync_to_async(response.close)()
 
             if response is None:
-                await signals.request_finished.asend(sender=self.__class__)
-            else:
-                await sync_to_async(response.close)()
+                if signals.request_finished.receivers:
+                    await signals.request_finished.asend(sender=self.__class__)
 
     async def run_get_response(self, request):
         """Get async response."""
@@ -251,11 +283,12 @@ class RSGIHandler(base.BaseHandler):
 
     async def send_response(self, response, protocol):
         """Encode and send a response out over RSGI."""
-        response_headers = []
-        for header, value in response.items():
-            response_headers.append((header, value))
-        for c in response.cookies.values():
-            response_headers.append(("Set-Cookie", c.OutputString()))
+        response_headers = [(header, value) for header, value in response.items()]
+        if response.cookies:
+            # OutputString() is relatively slow but necessary
+            response_headers.extend(
+                ("Set-Cookie", c.OutputString()) for c in response.cookies.values()
+            )
 
         # Optimization for file responses.
         if (
