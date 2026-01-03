@@ -32,6 +32,7 @@ dependencies = [
 dev = [
     "pytest",
     "pytest-django",
+    "granian[uvloop,reload]",
 ]
 
 [tool.pytest]
