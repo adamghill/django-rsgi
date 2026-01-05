@@ -77,7 +77,7 @@ class RSGIRequest(HttpRequest):
     and wraps request body handling.
     """
 
-    def __init__(self, scope, body_file):
+    def __init__(self, scope, body_file, script_prefix=None):
         self.scope = scope
         self._post_parse_error = False
         self._read_started = False
@@ -86,12 +86,13 @@ class RSGIRequest(HttpRequest):
         path = scope.path
         self.path = path
 
-        script_name = get_script_prefix(scope)
-        self.script_name = script_name
+        if script_prefix is None:
+            script_prefix = get_script_prefix(scope)
+        self.script_name = script_prefix
 
-        # Optimization: Only perform removeprefix if script_name is not empty
-        if script_name:
-            self.path_info = path.removeprefix(script_name)
+        # Optimization: Only perform removeprefix if script_prefix is not empty
+        if script_prefix:
+            self.path_info = path.removeprefix(script_prefix)
         else:
             self.path_info = path
 
@@ -103,7 +104,7 @@ class RSGIRequest(HttpRequest):
         self.META = {
             "REQUEST_METHOD": method,
             "QUERY_STRING": scope.query_string or "",
-            "SCRIPT_NAME": script_name,
+            "SCRIPT_NAME": script_prefix,
             "PATH_INFO": self.path_info,
             "wsgi.multithread": True,
             "wsgi.multiprocess": True,
@@ -135,8 +136,13 @@ class RSGIRequest(HttpRequest):
         # Headers normalization loop
         meta = self.META
         headers = scope.headers
+        header_name_cache = _HEADER_NAME_CACHE
+
         for name in headers:
-            corrected_name = get_normalized_header_name(name)
+            try:
+                corrected_name = header_name_cache[name]
+            except KeyError:
+                corrected_name = get_normalized_header_name(name)
 
             # Using get_all to join multiple header values as per Django standards
             values = headers.get_all(name)
@@ -226,7 +232,9 @@ class RSGIHandler(base.BaseHandler):
                 await signals.request_started.asend(sender=self.__class__, scope=scope)
 
             # Get the request and check for basic issues.
-            request, error_response = self.create_request(scope, body_file)
+            request, error_response = self.create_request(
+                scope, body_file, script_prefix=script_prefix
+            )
             if request is None:
                 await self.send_response(error_response, protocol)
                 await sync_to_async(error_response.close)()
@@ -254,13 +262,15 @@ class RSGIHandler(base.BaseHandler):
             response.block_size = self.chunk_size
         return response
 
-    def create_request(self, scope, body_file):
+    def create_request(self, scope, body_file, script_prefix=None):
         """
         Create the Request object and returns either (request, None) or
         (None, response) if there is an error response.
         """
         try:
-            return self.request_class(scope, body_file), None
+            return self.request_class(
+                scope, body_file, script_prefix=script_prefix
+            ), None
         except UnicodeDecodeError:
             logger.warning(
                 "Bad Request (UnicodeDecodeError)",
